@@ -16,12 +16,16 @@ const sha = s => crypto.createHash('sha256').update(s).digest('hex');
 
 async function loadRaw() {
   const fromFile = () => { try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+  // On Render the disk is wiped on every restart, so running without a database would silently lose everyone's
+  // accounts. Refuse to start instead: Render then keeps the last working version running.
+  if (!PG_URL && process.env.RENDER) throw new Error('DATABASE_URL is not set in Render > Environment');
   if (!PG_URL) return fromFile();
   const { Pool } = require('pg');
   const local = /@(localhost|127\.0\.0\.1)[:/]/.test(PG_URL);
   pg = new Pool({ connectionString: PG_URL, max: 3, ssl: local ? false : { rejectUnauthorized: false } });
   pg.on('error', e => console.error('Database connection error:', e.message));
   await pg.query('create table if not exists friendchat (k text primary key, v text not null)');
+  await pg.query('create table if not exists friendchat_backups (at timestamptz primary key default now(), v text not null)');
   const r = await pg.query("select v from friendchat where k = 'db'");
   return r.rows[0] ? JSON.parse(r.rows[0].v) : fromFile(); // first run: carry over a local db.json if one exists
 }
@@ -42,7 +46,7 @@ function prepare(raw) {
 }
 
 const tickets = new Map(); // one-use, 30-second tickets for the live connection
-let dirty = false, saving = null;
+let dirty = false, saving = null, lastBackup = 0;
 const save = () => { dirty = true; };
 function flush() {
   if (!dirty || !loaded || saving) return saving;
@@ -50,7 +54,14 @@ function flush() {
   const data = JSON.stringify(db);
   // .then() defers the work, so `saving` is always set before the finally below clears it
   saving = Promise.resolve().then(async () => {
-    if (pg) await pg.query('insert into friendchat (k, v) values ($1, $2) on conflict (k) do update set v = excluded.v', ['db', data]);
+    if (pg) {
+      await pg.query('insert into friendchat (k, v) values ($1, $2) on conflict (k) do update set v = excluded.v', ['db', data]);
+      if (Date.now() - lastBackup > 3600000) { // hourly snapshot, last 3 days kept, so a mistake can be undone
+        lastBackup = Date.now();
+        await pg.query('insert into friendchat_backups (v) values ($1)', [data]);
+        await pg.query("delete from friendchat_backups where at < now() - interval '3 days'");
+      }
+    }
     else { fs.writeFileSync(FILE + '.tmp', data); fs.renameSync(FILE + '.tmp', FILE); }
   }).catch(e => { dirty = true; console.error('Save failed, will retry:', e.message); })
     .finally(() => { saving = null; });
@@ -83,7 +94,7 @@ function clean(s) {
   for (const m of norm.matchAll(badRe)) for (let i = m.index; i < m.index + m[0].length; i++) out[i] = '*';
   return out.join('');
 }
-const pub = m => ({ id: m.id, from: m.from, text: m.text, time: m.time, ...(m.re ? { re: m.re } : {}), ...(m.ed ? { edited: m.ed } : {}) });
+const pub = m => ({ id: m.id, from: m.from, text: m.text, time: m.time, ...(m.gif ? { gif: m.gif } : {}), ...(m.re ? { re: m.re } : {}), ...(m.ed ? { edited: m.ed } : {}) });
 
 function members(convo) {
   if (convo.startsWith('g:')) { const g = db.groups[convo.slice(2)]; return g ? g.members : null; }
@@ -109,6 +120,14 @@ const count = (key, ms) => { const now = Date.now(); return (buckets.get(key) ||
 const hit = key => { const a = buckets.get(key) || []; a.push(Date.now()); buckets.set(key, a.slice(-200)); };
 const over = (key, max, ms) => { hit(key); return count(key, ms) > max; }; // true when more than max events in ms
 setInterval(() => { const now = Date.now(); for (const [k, a] of buckets) if (!a.length || now - a[a.length - 1] > 3600000) buckets.delete(k); }, 60000).unref();
+
+// ---- voice calls: the server only passes call setup messages between two friends; audio goes directly between them ----
+const calls = new Map();
+setInterval(() => {
+  for (const [id, c] of calls) if (Date.now() - c.touched > (c.accepted ? 45000 : 60000)) {
+    calls.delete(id); c.users.forEach(k => push(k, { type: 'call', action: 'end', id }));
+  }
+}, 5000).unref();
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -149,7 +168,8 @@ const server = http.createServer(async (req, res) => {
         if (count('fail:' + k, 600000) >= 10) return fail(429, 'Too many wrong passwords for this account, try again in 10 minutes');
         const us = db.users[k];
         const good = hashPw(pw, us ? us.salt : '00'); // same work whether or not the user exists
-        if (!us || !crypto.timingSafeEqual(Buffer.from(good), Buffer.from(us.hash))) { hit('fail:' + k); return fail(401, 'Wrong username or password'); }
+        if (!us) { hit('fail:' + k); return fail(404, 'Username not found'); }
+        if (!crypto.timingSafeEqual(Buffer.from(good), Buffer.from(us.hash))) { hit('fail:' + k); return fail(401, 'Wrong username or password'); }
       }
       const t = crypto.randomBytes(24).toString('hex');
       db.tokens[sha(t)] = { k, t: Date.now() };
@@ -200,6 +220,43 @@ const server = http.createServer(async (req, res) => {
       return send(200, { ticket: tk });
     }
 
+    if (req.method === 'GET' && p === '/features') return send(200, {
+      giphyKey: process.env.GIPHY_API_KEY || '',
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, ...(process.env.TURN_URL ? [{ urls: process.env.TURN_URL, username: process.env.TURN_USERNAME || '', credential: process.env.TURN_PASSWORD || '' }] : [])]
+    });
+    if (req.method === 'GET' && p === '/calls/current') {
+      const c = [...calls.values()].find(c => c.users.includes(me));
+      return send(200, { call: c ? { id: c.id, from: db.users[c.users[0]]?.name, to: db.users[c.users[1]]?.name, accepted: c.accepted } : null });
+    }
+    if (req.method === 'POST' && p === '/calls/start') {
+      const to = K(String(body.to || '').trim());
+      if (!db.users[to]) return fail(404, 'Username not found');
+      if (!U.friends.includes(to)) return fail(403, 'Only friends can call each other');
+      if ([...calls.values()].some(c => c.users.includes(me) || c.users.includes(to))) return fail(409, 'You or your friend are already in a call');
+      const id = crypto.randomBytes(12).toString('hex');
+      const c = { id, users: [me, to], accepted: false, touched: Date.now() }; calls.set(id, c);
+      push(to, { type: 'call', action: 'ring', id, from: U.name });
+      return send(200, { id });
+    }
+    if (req.method === 'POST' && p === '/calls/signal') {
+      const c = calls.get(String(body.id || ''));
+      if (!c || !c.users.includes(me)) return fail(404, 'Call ended');
+      const other = c.users.find(k => k !== me);
+      if (!db.users[other] || !U.friends.includes(other)) { calls.delete(c.id); return fail(403, 'You are no longer friends'); }
+      const action = body.action;
+      if (!['accept', 'offer', 'answer', 'ice', 'end', 'heartbeat'].includes(action)) return fail(400, 'Invalid call signal');
+      if (action === 'accept') {
+        if (me !== c.users[1] || c.accepted) return fail(409, 'Call already answered');
+        c.accepted = true;
+      }
+      if (['offer', 'answer', 'ice'].includes(action) && !c.accepted) return fail(409, 'Call has not been accepted');
+      if (['offer', 'answer'].includes(action) && (!body.data || body.data.type !== action || typeof body.data.sdp !== 'string')) return fail(400, 'Invalid call description');
+      c.touched = Date.now();
+      if (action === 'end') calls.delete(c.id);
+      if (action !== 'heartbeat') push(other, { type: 'call', action, id: c.id, from: U.name, data: body.data });
+      return send(200, { ok: 1 });
+    }
+
     // ---- account: change password / delete account (both need the current password) ----
     const checkPw = pw => {
       if (count('fail:' + me, 600000) >= 10) return 'locked';
@@ -246,12 +303,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/send') {
       const convo = String(body.convo || ''), text = clean(String(body.text || '').trim().slice(0, 500)), mem = members(convo);
       if (!mem || !mem.includes(me)) return fail(403, 'No access');
-      if (!text) return fail(400, 'Empty message');
+      const gif = String(body.gif || ''); // only GIPHY image links are allowed
+      if (gif && !/^https:\/\/(?:[a-z0-9-]+\.)*giphy\.com\/[^\s]{1,1800}$/i.test(gif)) return fail(400, 'Invalid GIPHY image');
+      if (!text && !gif) return fail(400, 'Empty message');
       if (over('send:' + me, 20, 10000)) return fail(429, 'Slow down');
       const arr = db.msgs[convo] = db.msgs[convo] || [];
-      const m = { id: crypto.randomBytes(6).toString('hex'), k: me, from: U.name, text, time: Date.now() };
+      const m = { id: crypto.randomBytes(6).toString('hex'), k: me, from: U.name, text, time: Date.now(), ...(gif ? { gif } : {}) };
       const ref = body.replyTo && arr.find(x => x.id === String(body.replyTo)); // replies only to a message in this chat
-      if (ref) m.re = { id: ref.id, from: ref.from, text: ref.text.slice(0, 80) };
+      if (ref) m.re = { id: ref.id, from: ref.from, text: (ref.gif ? '[GIF] ' : '') + ref.text.slice(0, 80) };
       arr.push(m); if (arr.length > 500) arr.splice(0, arr.length - 500);
       save();
       const out = pub(m);
@@ -278,8 +337,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && p.startsWith('/friends/')) {
-      const t = K(body.user || body.to || ''), T = db.users[t];
-      if (!T) return send(200, { ok: 1 }); // same answer whether or not the name exists: no username probing
+      const t = K(String(body.user || body.to || '').trim()), T = db.users[t];
+      if (!T) return fail(404, 'Username not found');
       if (t === me) return fail(400, "That's you");
       const befriend = () => {
         [U.inc, U.out].forEach(a => rm(a, t)); [T.inc, T.out].forEach(a => rm(a, me));
@@ -288,7 +347,7 @@ const server = http.createServer(async (req, res) => {
       };
       if (p === '/friends/request') {
         if (U.friends.includes(t)) return send(200, { ok: 1 });
-        if (U.inc.includes(t)) befriend();
+        if (U.inc.includes(t)) return fail(409, 'This user already sent you a request. Accept it in Friend requests.');
         else if (!U.out.includes(t)) {
           if (U.out.length >= 50 || T.inc.length >= 200) return fail(400, 'Too many pending requests');
           U.out.push(t); T.inc.push(me);
