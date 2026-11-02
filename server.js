@@ -67,6 +67,24 @@ const ping = (...ks) => new Set(ks.flat()).forEach(k => push(k, { type: 'state' 
 const rm = (a, k) => { const i = a.indexOf(k); if (i >= 0) a.splice(i, 1); };
 const dmId = (a, b) => 'd:' + [a, b].sort().join(':');
 
+// ---- family friendly: swear words are starred out on the server, so every copy of the app shows clean text ----
+// The owner can turn it off by setting FAMILY_FRIENDLY=off on Render. Users can't turn it off.
+const FAMILY = process.env.FAMILY_FRIENDLY !== 'off';
+const BAD_ANY = ['fuck', 'shit', 'cunt', 'nigger', 'nigga', 'faggot', 'bitch', 'whore', 'slut', 'pussy', 'asshole',
+  'bastard', 'wank', 'bollock', 'dickhead', 'เหี้ย', 'ควย', 'เย็ด', 'แม่ง', 'สัส']; // caught even inside other words
+const BAD_WORD = ['ass', 'dick', 'cock', 'fag', 'tit', 'tits', 'piss', 'damn', 'crap', 'retard', 'hoe', 'twat', 'prick']; // whole words only
+const LEET = { 0: 'o', 1: 'i', 3: 'e', 4: 'a', 5: 's', 7: 't', '@': 'a', $: 's', '!': 'i' };
+const badRe = new RegExp('(' + BAD_ANY.join('|') + ')|(?<![a-z])(' + BAD_WORD.join('|') + ')(?![a-z])', 'g');
+function clean(s) {
+  if (!FAMILY) return s;
+  let norm = ''; // same length as s, so match positions line up with the original text
+  for (const c of s.split('')) { const l = c.toLowerCase(); norm += LEET[l] || (l.length === 1 ? l : c); }
+  const out = s.split('');
+  for (const m of norm.matchAll(badRe)) for (let i = m.index; i < m.index + m[0].length; i++) out[i] = '*';
+  return out.join('');
+}
+const pub = m => ({ id: m.id, from: m.from, text: m.text, time: m.time, ...(m.re ? { re: m.re } : {}), ...(m.ed ? { edited: m.ed } : {}) });
+
 function members(convo) {
   if (convo.startsWith('g:')) { const g = db.groups[convo.slice(2)]; return g ? g.members : null; }
   const m = /^d:([^:]+):([^:]+)$/.exec(convo);
@@ -121,6 +139,7 @@ const server = http.createServer(async (req, res) => {
       if (p === '/signup') {
         if (!/^[A-Za-z0-9_]{3,20}$/.test(name)) return fail(400, 'Username: 3-20 letters, numbers or _');
         if (pw.length < 8 || pw.length > 100) return fail(400, 'Password must be at least 8 characters');
+        if (clean(name) !== name) return fail(400, 'Please pick a family-friendly username');
         if (db.users[k]) return fail(409, 'Username already taken');
         if (over('signups', 100, 3600000)) return fail(429, 'Too many new accounts right now, try again later');
         if (Object.keys(db.users).length >= 2000) return fail(503, 'Server is full');
@@ -222,19 +241,34 @@ const server = http.createServer(async (req, res) => {
       const convo = u.searchParams.get('convo') || '', mem = members(convo);
       if (!mem || !mem.includes(me)) return fail(403, 'No access');
       const n = Math.min(+u.searchParams.get('limit') || 200, 500);
-      return send(200, { messages: (db.msgs[convo] || []).slice(-n).map(({ id, from, text, time }) => ({ id, from, text, time })) });
+      return send(200, { messages: (db.msgs[convo] || []).slice(-n).map(pub) });
     }
     if (req.method === 'POST' && p === '/send') {
-      const convo = String(body.convo || ''), text = String(body.text || '').trim().slice(0, 500), mem = members(convo);
+      const convo = String(body.convo || ''), text = clean(String(body.text || '').trim().slice(0, 500)), mem = members(convo);
       if (!mem || !mem.includes(me)) return fail(403, 'No access');
       if (!text) return fail(400, 'Empty message');
       if (over('send:' + me, 20, 10000)) return fail(429, 'Slow down');
-      const m = { id: crypto.randomBytes(6).toString('hex'), k: me, from: U.name, text, time: Date.now() };
       const arr = db.msgs[convo] = db.msgs[convo] || [];
+      const m = { id: crypto.randomBytes(6).toString('hex'), k: me, from: U.name, text, time: Date.now() };
+      const ref = body.replyTo && arr.find(x => x.id === String(body.replyTo)); // replies only to a message in this chat
+      if (ref) m.re = { id: ref.id, from: ref.from, text: ref.text.slice(0, 80) };
       arr.push(m); if (arr.length > 500) arr.splice(0, arr.length - 500);
       save();
-      const out = { id: m.id, from: m.from, text: m.text, time: m.time };
+      const out = pub(m);
       mem.forEach(k => push(k, { type: 'msg', convo, msg: out }));
+      return send(200, { msg: out });
+    }
+    if (req.method === 'POST' && p === '/edit') {
+      const convo = String(body.convo || ''), mem = members(convo);
+      if (!mem || !mem.includes(me)) return fail(403, 'No access');
+      const text = clean(String(body.text || '').trim().slice(0, 500));
+      if (!text) return fail(400, 'Empty message');
+      if (over('send:' + me, 20, 10000)) return fail(429, 'Slow down');
+      const m = (db.msgs[convo] || []).find(x => x.id === String(body.id || ''));
+      if (!m || m.k !== me) return fail(403, 'You can only edit your own messages');
+      m.text = text; m.ed = Date.now(); save();
+      const out = pub(m);
+      mem.forEach(k => push(k, { type: 'edit', convo, msg: out }));
       return send(200, { msg: out });
     }
     if (req.method === 'POST' && p === '/read') {
@@ -270,7 +304,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && p === '/groups') {
-      const name = String(body.name || '').trim().slice(0, 30);
+      const name = clean(String(body.name || '').trim().slice(0, 30));
       if (!name) return fail(400, 'Group needs a name');
       if (over('mkgroup:' + me, 10, 3600000)) return fail(429, 'Too many new groups, try later');
       if (Object.values(db.groups).filter(g => g.members.includes(me)).length >= 30) return fail(400, 'Too many groups');
