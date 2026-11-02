@@ -1,20 +1,63 @@
-// Friend Chat server: accounts, friends, groups, messages. No dependencies (Node 18+).
-// Run: node server.js   (env: PORT, DB_FILE)
+// Friend Chat server: accounts, friends, groups, messages. Node 18+, one dependency (pg).
+// Run: npm install && node server.js   (env: PORT, DATABASE_URL, DB_FILE)
 const http = require('http'), fs = require('fs'), crypto = require('crypto'), path = require('path');
 const PORT = process.env.PORT || 3000;
 const FILE = process.env.DB_FILE || path.join(__dirname, 'db.json');
 
+// Storage: set DATABASE_URL (e.g. a free Supabase Postgres) and data survives restarts and redeploys.
+// Without it, data goes to db.json, which free hosts like Render wipe on every restart.
+const PG_URL = process.env.DATABASE_URL || '';
+let pg = null, loaded = false;
 let db = { users: {}, tokens: {}, groups: {}, msgs: {} };
-try { db = { ...db, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) }; } catch {}
-let dirty = false;
+const PROTO = 1, MIN_CLIENT = 1; // bump MIN_CLIENT only for a breaking change
+const TOKEN_TTL = 30 * 864e5; // logins last 30 days of inactivity
+const nul = o => Object.assign(Object.create(null), o); // no __proto__/constructor tricks
+const sha = s => crypto.createHash('sha256').update(s).digest('hex');
+
+async function loadRaw() {
+  const fromFile = () => { try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+  if (!PG_URL) return fromFile();
+  const { Pool } = require('pg');
+  const local = /@(localhost|127\.0\.0\.1)[:/]/.test(PG_URL);
+  pg = new Pool({ connectionString: PG_URL, max: 3, ssl: local ? false : { rejectUnauthorized: false } });
+  pg.on('error', e => console.error('Database connection error:', e.message));
+  await pg.query('create table if not exists friendchat (k text primary key, v text not null)');
+  const r = await pg.query("select v from friendchat where k = 'db'");
+  return r.rows[0] ? JSON.parse(r.rows[0].v) : fromFile(); // first run: carry over a local db.json if one exists
+}
+
+function prepare(raw) {
+  db = { users: {}, tokens: {}, groups: {}, msgs: {}, ...(raw || {}) };
+  // tolerate data saved by older server versions
+  for (const u of Object.values(db.users)) for (const f of ['friends', 'inc', 'out']) if (!Array.isArray(u[f])) u[f] = [];
+  for (const u of Object.values(db.users)) if (!u.read || typeof u.read !== 'object') u.read = {};
+  db.users = nul(db.users); db.groups = nul(db.groups); db.msgs = nul(db.msgs);
+  for (const u of Object.values(db.users)) u.read = nul(u.read);
+  // session tokens are stored hashed (so a leaked database can't be used to log in); upgrade old plaintext ones
+  const oldTok = db.tokens; db.tokens = nul({});
+  for (const [t, v] of Object.entries(oldTok || {})) {
+    const rec = typeof v === 'string' ? { k: v, t: Date.now() } : v;
+    db.tokens[t.length === 64 ? t : sha(t)] = rec;
+  }
+}
+
+const tickets = new Map(); // one-use, 30-second tickets for the live connection
+let dirty = false, saving = null;
 const save = () => { dirty = true; };
-const flush = () => {
-  if (!dirty) return; dirty = false;
-  fs.writeFileSync(FILE + '.tmp', JSON.stringify(db));
-  fs.renameSync(FILE + '.tmp', FILE);
-};
+function flush() {
+  if (!dirty || !loaded || saving) return saving;
+  dirty = false;
+  const data = JSON.stringify(db);
+  // .then() defers the work, so `saving` is always set before the finally below clears it
+  saving = Promise.resolve().then(async () => {
+    if (pg) await pg.query('insert into friendchat (k, v) values ($1, $2) on conflict (k) do update set v = excluded.v', ['db', data]);
+    else { fs.writeFileSync(FILE + '.tmp', data); fs.renameSync(FILE + '.tmp', FILE); }
+  }).catch(e => { dirty = true; console.error('Save failed, will retry:', e.message); })
+    .finally(() => { saving = null; });
+  return saving;
+}
 setInterval(flush, 1000).unref();
-for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { flush(); process.exit(); });
+for (const s of ['SIGINT', 'SIGTERM']) process.on(s, async () => { await saving; await flush(); process.exit(); });
 
 const K = s => String(s).toLowerCase();
 const hashPw = (pw, salt) => crypto.scryptSync(pw, salt, 32).toString('hex');
@@ -43,21 +86,24 @@ function state(k) {
   return { name: u.name, friends: u.friends.map(nm), incoming: u.inc.map(nm), outgoing: u.out.map(nm), groups, unread };
 }
 
-const hits = new Map();
-const limited = ip => {
-  const now = Date.now(), a = (hits.get(ip) || []).filter(t => now - t < 60000);
-  a.push(now); hits.set(ip, a); return a.length > 30;
-};
+const buckets = new Map();
+const count = (key, ms) => { const now = Date.now(); return (buckets.get(key) || []).filter(t => now - t < ms).length; };
+const hit = key => { const a = buckets.get(key) || []; a.push(Date.now()); buckets.set(key, a.slice(-200)); };
+const over = (key, max, ms) => { hit(key); return count(key, ms) > max; }; // true when more than max events in ms
+setInterval(() => { const now = Date.now(); for (const [k, a] of buckets) if (!a.length || now - a[a.length - 1] > 3600000) buckets.delete(k); }, 60000).unref();
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const u = new URL(req.url, 'http://x'), p = u.pathname;
   const send = (code, o) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
   const fail = (code, msg) => send(code, { error: msg });
   if (req.method === 'GET' && p === '/') return res.end('Friend Chat server OK');
+  if (req.method === 'GET' && p === '/version') return send(200, { proto: PROTO, min: MIN_CLIENT });
 
   let body = {};
   if (req.method === 'POST') {
@@ -68,41 +114,109 @@ http.createServer(async (req, res) => {
 
   try {
     if (req.method === 'POST' && (p === '/signup' || p === '/login')) {
-      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-      if (limited(ip)) return fail(429, 'Too many attempts, wait a minute');
+      const xf = (req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+      const ip = xf.length ? xf[xf.length - 1] : req.socket.remoteAddress; // last hop is added by the host's proxy; the first can be forged
+      if (over('ip:' + ip, 30, 60000)) return fail(429, 'Too many attempts, wait a minute');
       const name = String(body.username || '').trim(), pw = String(body.password || ''), k = K(name);
       if (p === '/signup') {
         if (!/^[A-Za-z0-9_]{3,20}$/.test(name)) return fail(400, 'Username: 3-20 letters, numbers or _');
-        if (pw.length < 6 || pw.length > 100) return fail(400, 'Password must be at least 6 characters');
+        if (pw.length < 8 || pw.length > 100) return fail(400, 'Password must be at least 8 characters');
         if (db.users[k]) return fail(409, 'Username already taken');
+        if (over('signups', 100, 3600000)) return fail(429, 'Too many new accounts right now, try again later');
+        if (Object.keys(db.users).length >= 2000) return fail(503, 'Server is full');
         const salt = crypto.randomBytes(16).toString('hex');
-        db.users[k] = { name, salt, hash: hashPw(pw, salt), friends: [], inc: [], out: [], read: {} };
+        db.users[k] = { name, salt, hash: hashPw(pw, salt), friends: [], inc: [], out: [], read: nul({}) };
       } else {
+        if (count('fail:' + k, 600000) >= 10) return fail(429, 'Too many wrong passwords for this account, try again in 10 minutes');
         const us = db.users[k];
-        if (!us || !crypto.timingSafeEqual(Buffer.from(hashPw(pw, us.salt)), Buffer.from(us.hash)))
-          return fail(401, 'Wrong username or password');
+        const good = hashPw(pw, us ? us.salt : '00'); // same work whether or not the user exists
+        if (!us || !crypto.timingSafeEqual(Buffer.from(good), Buffer.from(us.hash))) { hit('fail:' + k); return fail(401, 'Wrong username or password'); }
       }
       const t = crypto.randomBytes(24).toString('hex');
-      db.tokens[t] = k; save();
+      db.tokens[sha(t)] = { k, t: Date.now() };
+      Object.entries(db.tokens).filter(([, v]) => v.k === k).sort((a, b) => b[1].t - a[1].t)
+        .slice(10).forEach(([h]) => delete db.tokens[h]); // keep the 10 newest logins per account
+      save();
       return send(200, { token: t, name: db.users[k].name });
     }
 
-    const tok = (req.headers.authorization || '').replace(/^Bearer /, '') || u.searchParams.get('token');
-    const me = db.tokens[tok];
+    // token in a URL is only accepted for /events, and only for older extensions that have no ticket support
+    const isEv = req.method === 'GET' && p === '/events';
+    const tok = String((req.headers.authorization || '').replace(/^Bearer /, '') || (isEv && u.searchParams.get('token')) || '');
+    let th = sha(tok), rec = db.tokens[th];
+    const ticket = u.searchParams.get('ticket');
+    if (isEv && ticket) { // one-use ticket: keeps the real token out of URLs and logs
+      const tk = tickets.get(ticket); tickets.delete(ticket);
+      rec = tk && tk.exp > Date.now() && db.tokens[tk.h] ? { k: tk.k, t: Date.now() } : null; // dead if that login logged out
+      th = tk && tk.h;
+    } else if (rec && Date.now() - rec.t > TOKEN_TTL) { delete db.tokens[th]; save(); rec = null; }
+    else if (rec) rec.t = Date.now();
+    const me = rec && rec.k;
     if (!me || !db.users[me]) return fail(401, 'Not logged in');
     const U = db.users[me];
+    if (req.method === 'POST' && over('post:' + me, 120, 60000)) return fail(429, 'Slow down');
     const ok = (...notify) => { save(); ping(me, ...notify); send(200, { ok: 1 }); };
 
     if (req.method === 'GET' && p === '/events') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
       res.write(': ok\n\n');
-      const set = clients.get(me) || new Set(); set.add(res); clients.set(me, set);
+      const set = clients.get(me) || new Set();
+      if (set.size >= 5) { const old = set.values().next().value; set.delete(old); old.end(); } // cap live connections per user
+      res.th = th; set.add(res); clients.set(me, set);
       const hb = setInterval(() => res.write(': hb\n\n'), 25000);
       req.on('close', () => { clearInterval(hb); set.delete(res); });
       return;
     }
     if (req.method === 'GET' && p === '/me') return send(200, state(me));
-    if (req.method === 'POST' && p === '/logout') { delete db.tokens[tok]; save(); return send(200, { ok: 1 }); }
+    if (req.method === 'POST' && p === '/logout') {
+      delete db.tokens[th]; save();
+      for (const r of [...(clients.get(me) || [])]) if (r.th === th) r.end(); // logged out = live updates stop too
+      return send(200, { ok: 1 });
+    }
+    if (req.method === 'POST' && p === '/ticket') {
+      if (over('ticket:' + me, 30, 60000)) return fail(429, 'Slow down');
+      for (const [a, b] of tickets) if (b.exp < Date.now()) tickets.delete(a);
+      const tk = crypto.randomBytes(16).toString('hex');
+      tickets.set(tk, { k: me, h: th, exp: Date.now() + 30000 });
+      return send(200, { ticket: tk });
+    }
+
+    // ---- account: change password / delete account (both need the current password) ----
+    const checkPw = pw => {
+      if (count('fail:' + me, 600000) >= 10) return 'locked';
+      const good = crypto.timingSafeEqual(Buffer.from(hashPw(String(pw || '').slice(0, 200), U.salt)), Buffer.from(U.hash));
+      if (!good) hit('fail:' + me);
+      return good;
+    };
+    const pwFail = (c, msg) => c === 'locked' ? fail(429, 'Too many wrong passwords, wait 10 minutes') : fail(401, msg);
+    const kick = keep => { // end every login of this account except `keep`
+      for (const [h, v] of Object.entries(db.tokens)) if (v.k === me && h !== keep) delete db.tokens[h];
+      for (const r of [...(clients.get(me) || [])]) if (r.th !== keep) r.end();
+    };
+    if (req.method === 'POST' && p === '/account/password') {
+      const c = checkPw(body.old); if (c !== true) return pwFail(c, 'Current password is wrong');
+      const np = String(body.new || '');
+      if (np.length < 8 || np.length > 100) return fail(400, 'New password must be at least 8 characters');
+      U.salt = crypto.randomBytes(16).toString('hex'); U.hash = hashPw(np, U.salt);
+      kick(th); save(); return send(200, { ok: 1 });
+    }
+    if (req.method === 'POST' && p === '/account/delete') {
+      const c = checkPw(body.password); if (c !== true) return pwFail(c, 'Password is wrong');
+      const touched = new Set();
+      for (const f of [...U.friends, ...U.inc, ...U.out]) {
+        const F = db.users[f];
+        if (F) { [F.friends, F.inc, F.out].forEach(a => rm(a, me)); touched.add(f); }
+        delete db.msgs[dmId(me, f)];
+      }
+      for (const [id, g] of Object.entries(db.groups)) {
+        if (!g.members.includes(me)) continue;
+        g.members = g.members.filter(x => x !== me);
+        if (db.msgs['g:' + id]) db.msgs['g:' + id] = db.msgs['g:' + id].filter(m => m.k !== me); // their group messages go too
+        if (g.members.length) g.members.forEach(x => touched.add(x)); else { delete db.groups[id]; delete db.msgs['g:' + id]; }
+      }
+      kick(null); delete db.users[me]; save(); ping([...touched]);
+      return send(200, { ok: 1 });
+    }
 
     if (req.method === 'GET' && p === '/messages') {
       const convo = u.searchParams.get('convo') || '', mem = members(convo);
@@ -114,6 +228,7 @@ http.createServer(async (req, res) => {
       const convo = String(body.convo || ''), text = String(body.text || '').trim().slice(0, 500), mem = members(convo);
       if (!mem || !mem.includes(me)) return fail(403, 'No access');
       if (!text) return fail(400, 'Empty message');
+      if (over('send:' + me, 20, 10000)) return fail(429, 'Slow down');
       const m = { id: crypto.randomBytes(6).toString('hex'), k: me, from: U.name, text, time: Date.now() };
       const arr = db.msgs[convo] = db.msgs[convo] || [];
       arr.push(m); if (arr.length > 500) arr.splice(0, arr.length - 500);
@@ -130,7 +245,7 @@ http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && p.startsWith('/friends/')) {
       const t = K(body.user || body.to || ''), T = db.users[t];
-      if (!T) return fail(404, 'No user with that username');
+      if (!T) return send(200, { ok: 1 }); // same answer whether or not the name exists: no username probing
       if (t === me) return fail(400, "That's you");
       const befriend = () => {
         [U.inc, U.out].forEach(a => rm(a, t)); [T.inc, T.out].forEach(a => rm(a, me));
@@ -140,11 +255,15 @@ http.createServer(async (req, res) => {
       if (p === '/friends/request') {
         if (U.friends.includes(t)) return send(200, { ok: 1 });
         if (U.inc.includes(t)) befriend();
-        else if (!U.out.includes(t)) { U.out.push(t); T.inc.push(me); }
+        else if (!U.out.includes(t)) {
+          if (U.out.length >= 50 || T.inc.length >= 200) return fail(400, 'Too many pending requests');
+          U.out.push(t); T.inc.push(me);
+        }
         return ok(t);
       }
       if (p === '/friends/accept') { if (!U.inc.includes(t)) return fail(400, 'No such request'); befriend(); return ok(t); }
       if (p === '/friends/decline' || p === '/friends/remove') {
+        if (U.friends.includes(t)) delete db.msgs[dmId(me, t)]; // unfriending erases the DM history for both
         [U.inc, U.out, U.friends].forEach(a => rm(a, t)); [T.inc, T.out, T.friends].forEach(a => rm(a, me));
         return ok(t);
       }
@@ -153,6 +272,8 @@ http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/groups') {
       const name = String(body.name || '').trim().slice(0, 30);
       if (!name) return fail(400, 'Group needs a name');
+      if (over('mkgroup:' + me, 10, 3600000)) return fail(429, 'Too many new groups, try later');
+      if (Object.values(db.groups).filter(g => g.members.includes(me)).length >= 30) return fail(400, 'Too many groups');
       const id = crypto.randomBytes(5).toString('hex');
       db.groups[id] = { name, members: [me] };
       save(); ping(me); return send(200, { id });
@@ -162,9 +283,8 @@ http.createServer(async (req, res) => {
       if (!g || !g.members.includes(me)) return fail(403, 'No access');
       if (p === '/groups/invite') {
         const t = K(body.user || '');
-        if (!db.users[t]) return fail(404, 'No user with that username');
-        if (!U.friends.includes(t)) return fail(400, 'You can only invite friends');
-        if (!g.members.includes(t)) g.members.push(t);
+        if (!db.users[t] || !U.friends.includes(t)) return fail(400, 'You can only invite friends');
+        if (!g.members.includes(t)) { if (g.members.length >= 100) return fail(400, 'Group is full'); g.members.push(t); }
         return ok(g.members);
       }
       const rest = g.members.filter(x => x !== me);
@@ -173,4 +293,11 @@ http.createServer(async (req, res) => {
     }
     fail(404, 'Not found');
   } catch (e) { console.error(e); if (!res.headersSent) fail(500, 'Server error'); }
-}).listen(PORT, () => console.log('Friend Chat server on :' + PORT));
+});
+
+// Only start once the data is loaded. If loading fails, stop instead of starting empty:
+// starting empty would overwrite everyone's saved accounts on the next save.
+loadRaw().then(raw => {
+  prepare(raw); loaded = true;
+  server.listen(PORT, () => console.log('Friend Chat server on :' + PORT + (pg ? ' (saving to Postgres)' : ' (saving to ' + FILE + ')')));
+}).catch(e => { console.error('Could not load saved data, not starting:', e.message); process.exit(1); });
