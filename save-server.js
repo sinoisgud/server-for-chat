@@ -45,6 +45,14 @@ const server = http.createServer((req, res) => {
       if (acc.h !== h) return send(res, 403, { error: 'Wrong password.' });
       return send(res, 200, { ok: true, save: acc.save, at: acc.at });
     }
+    if (req.url === '/password') {
+      if (!acc) return send(res, 404, { error: 'No account with that name.' });
+      if (acc.h !== h) return send(res, 403, { error: 'Wrong password.' });
+      const nh = String(m.nh || '');
+      if (!nh) return send(res, 400, { error: 'missing new password' });
+      acc.h = nh; acc.at = Date.now(); dirty = true;
+      return send(res, 200, { ok: true });
+    }
     if (req.url === '/save') {
       if (!acc) return send(res, 404, { error: 'No account with that name.' });
       if (acc.h !== h) return send(res, 403, { error: 'Wrong password.' });
